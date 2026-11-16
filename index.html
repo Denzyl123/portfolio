@@ -205,6 +205,13 @@ section.block { padding-block: clamp(56px, 8vw, 96px); border-top: 1px solid var
 .trailer-toggle:hover .play-disc { transform: scale(1.08); }
 .trailer-toggle.playing .play-disc { opacity: 0; transform: scale(.8); }
 .trailer-toggle:focus-visible { outline: 3px solid var(--duck); outline-offset: -3px; }
+/* Download progress ring around the play button, shown only while the trailer is still loading */
+.play-disc { position: relative; }
+.load-ring { position: absolute; top: -8px; left: -8px; width: 80px; height: 80px; transform: rotate(-90deg); opacity: 0; transition: opacity .25s; pointer-events: none; }
+.load-ring circle { fill: none; stroke-width: 3; }
+.load-ring .track { stroke: rgba(255, 255, 255, .35); }
+.load-ring .bar { stroke: var(--duck); stroke-dasharray: 235.62; stroke-dashoffset: 235.62; transition: stroke-dashoffset .2s linear; }
+.trailer-toggle.loading .load-ring { opacity: 1; transition-delay: .4s; }
 .trailer figcaption { font-size: var(--step--1); color: var(--muted); }
 .role-sub { font-family: var(--display); font-weight: 600; font-size: var(--step-1); color: var(--river); }
 .role-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
@@ -847,11 +854,11 @@ body:not([data-view="home"]) .home-pill { display: inline-flex; }
             then a boss-stage duck that misbehaves.</p>
           <figure class="trailer">
             <div class="trailer-frame">
-              <video muted playsinline preload="metadata" disablepictureinpicture controlslist="nofullscreen nodownload noremoteplayback" poster="img/duck-dash-trailer-poster.jpg" aria-label="Duck Dash: River Run trailer, 15 seconds of gameplay">
+              <video muted playsinline preload="none" disablepictureinpicture controlslist="nofullscreen nodownload noremoteplayback" poster="img/duck-dash-trailer-poster.jpg" aria-label="Duck Dash: River Run trailer, 15 seconds of gameplay">
                 <source src="img/duck-dash-trailer.mp4" type="video/mp4">
               </video>
               <button class="trailer-toggle" type="button" aria-label="Play trailer">
-                <span class="play-disc"><svg width="22" height="22" viewBox="0 0 14 14" aria-hidden="true"><path d="M3.5 1.5v11l9-5.5z" fill="currentColor"/></svg></span>
+                <span class="play-disc"><svg width="22" height="22" viewBox="0 0 14 14" aria-hidden="true"><path d="M3.5 1.5v11l9-5.5z" fill="currentColor"/></svg><svg class="load-ring" viewBox="0 0 80 80" aria-hidden="true"><circle class="track" cx="40" cy="40" r="37.5"/><circle class="bar" cx="40" cy="40" r="37.5"/></svg></span>
               </button>
             </div>
             <figcaption>The 15-second trailer I cut from real gameplay.</figcaption>
@@ -1251,17 +1258,80 @@ body:not([data-view="home"]) .home-pill { display: inline-flex; }
 
   const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
+  // Duck Dash trailer. When the Duck Dash page opens, the whole file downloads into memory,
+  // so playback can never stop to buffer, even on a slow connection. It then plays by itself
+  // once it is mostly on screen (not for visitors who prefer reduced motion), pauses when
+  // scrolled away and resumes on return. A ring round the play button shows the download.
   const video = document.querySelector('.trailer video');
   const toggle = document.querySelector('.trailer-toggle');
+  const bar = toggle.querySelector('.load-ring .bar');
+  const RING = 235.62; // circumference of the ring (2 × π × 37.5)
+  const watch = 'IntersectionObserver' in window; // without it: no autoplay, the button still works
+  const tv = { loading: false, ready: false, inView: !watch, played: false, userPaused: false, scrollPaused: false, queued: false };
   const showState = () => {
-    const playing = !video.paused && !video.ended;
+    const playing = !video.paused && !video.ended, waiting = tv.loading && !tv.ready;
     toggle.classList.toggle('playing', playing);
-    toggle.setAttribute('aria-label', playing ? 'Pause trailer' : 'Play trailer');
+    toggle.classList.toggle('loading', waiting);
+    toggle.setAttribute('aria-label', playing ? 'Pause trailer' : waiting ? 'Loading trailer' : 'Play trailer');
   };
-  toggle.addEventListener('click', () => { video.paused ? video.play().catch(() => {}) : video.pause(); });
+  const play = () => video.play().catch(() => {});
+  const autoplay = () => {
+    if (!tv.ready || !video.paused || !tv.inView) return;
+    if (tv.queued) { tv.queued = false; tv.played = true; play(); return; } // pressed play while it loaded
+    if (!watch || tv.userPaused || reduce) return;
+    if (!tv.played || tv.scrollPaused) { tv.played = true; tv.scrollPaused = false; play(); }
+  };
+  const ready = () => { tv.ready = true; showState(); autoplay(); };
+  const preload = () => {
+    if (tv.loading || tv.ready) return;
+    tv.loading = true; showState();
+    fetch(video.querySelector('source').src, { priority: 'low' })
+      .then(async res => {
+        if (!res.ok) throw new Error(res.status);
+        const total = +res.headers.get('Content-Length');
+        if (!total || !res.body) return res.blob();
+        const reader = res.body.getReader(), parts = [];
+        for (let got = 0; ;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          parts.push(value); got += value.length;
+          bar.style.strokeDashoffset = RING * (1 - got / total);
+        }
+        return new Blob(parts, { type: 'video/mp4' });
+      })
+      .then(blob => { video.src = URL.createObjectURL(blob); video.preload = 'auto'; })
+      // Could not download it in one go (e.g. the page was opened as a file): stream it as before.
+      .catch(() => { video.preload = 'auto'; video.load(); })
+      .finally(ready);
+  };
+  const trailer = {
+    enter() { // the Duck Dash page has just opened: start the download once the page has loaded
+      Object.assign(tv, { played: false, userPaused: false, scrollPaused: false, queued: false });
+      if (document.readyState === 'complete') preload(); else addEventListener('load', preload, { once: true });
+    },
+    leave() { // back to the start, so the next visit plays it from the top
+      tv.scrollPaused = tv.queued = false;
+      if (!video.paused || video.currentTime > 0) { video.pause(); video.load(); }
+      showState(); // load() swallows the pause event, so refresh the button here
+    },
+  };
+  toggle.addEventListener('click', () => {
+    if (!tv.ready) { tv.queued = true; return; }
+    if (video.paused) { tv.userPaused = false; tv.played = true; play(); }
+    else { tv.userPaused = true; video.pause(); }
+  });
   video.addEventListener('play', showState);
   video.addEventListener('pause', showState);
   video.addEventListener('ended', () => { video.load(); showState(); });
+  if (watch) {
+    new IntersectionObserver(([e]) => {
+      if (e.intersectionRatio >= 0.6) { tv.inView = true; autoplay(); }
+      else if (e.intersectionRatio < 0.25) {
+        tv.inView = false;
+        if (!video.paused) { tv.scrollPaused = true; video.pause(); }
+      }
+    }, { threshold: [0, 0.25, 0.6] }).observe(toggle.parentElement);
+  }
   showState();
 
 
@@ -1275,7 +1345,7 @@ body:not([data-view="home"]) .home-pill { display: inline-flex; }
     const changed = view.hidden;
     views.forEach(v => { v.hidden = v !== view; });
     document.body.dataset.view = view.id;
-    if (view.id !== 'duck-dash') video.pause();
+    if (view.id !== 'duck-dash') trailer.leave(); else if (changed) trailer.enter();
     if (changed && !reduce) { view.classList.remove('enter'); void view.offsetWidth; view.classList.add('enter'); }
     if (view === home && target && target !== home && id !== 'top') {
       target.scrollIntoView({ block: 'start', behavior: reduce ? 'auto' : 'smooth' });
